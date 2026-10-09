@@ -1,0 +1,1193 @@
+#!/usr/bin/env python3
+"""work: a small editor suite built from sway, foot and your editor of choice.
+
+usage:
+  work                 open the current folder
+  work DIR             open DIR on a new sway workspace: file tree on the
+                       left, editors in a tabbed pane on the right
+  work FILE            open FILE in the running work session that contains
+                       it (or start a session in the file's folder)
+  work --default-config
+                       print the default config (save it to
+                       ~/.config/work/config to change it)
+
+Keys in the file tree: press ? inside it.
+"""
+
+import configparser
+import curses
+import fcntl
+import hashlib
+import json
+import os
+import pty
+import re
+import secrets
+import select
+import shlex
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import time
+import traceback
+import tty
+
+SELF = os.path.realpath(__file__)
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/work-{os.getuid()}", "work")
+CONFIG_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "work", "config")
+
+DEFAULT_CONFIG = r"""
+# ~/.config/work/config: settings for `work`
+
+[work]
+# which [editor.NAME] section below to use
+editor = nano
+# width of the file tree, in percent of the screen
+tree_width = 22
+# show dotfiles in the tree (toggle at runtime with .)
+show_hidden = no
+
+# An editor profile:
+#   command   how to start it; {file} is replaced by the file's path
+#   save      keys that save the file
+#   quit      keys that close an unmodified file
+#   discard   keys that close a modified file without saving
+#   dirty     how to spot unsaved changes: "lockfile" or "none"
+#   lockfile  where the editor's vim-style lock/swap file lives;
+#             {dir} {name} {path} are the file's folder, name and full
+#             path, {path%} is the full path with / replaced by %
+# Keys: ^X = Ctrl+X, <C-x> = Ctrl+x, <CR> = Enter, <Esc> = Escape,
+# anything else is typed literally.
+
+[editor.nano]
+command = nano --locking {file}
+save = ^S
+quit = ^X
+discard = ^Xn
+dirty = lockfile
+lockfile = {dir}/.{name}.swp
+
+# Not tested yet. The lockfile path matches Arch's default vim setup.
+[editor.vim]
+command = vim {file}
+save = <C-\><C-N>:update<CR>
+quit = <C-\><C-N>:quit<CR>
+discard = <C-\><C-N>:quit!<CR>
+dirty = lockfile
+lockfile = ~/.cache/vim/swap/{path%}.swp
+"""
+
+
+def die(msg):
+    sys.exit(f"work: {msg}")
+
+
+def log(project, msg):
+    """Debug log: $XDG_RUNTIME_DIR/work/<project>.log"""
+    try:
+        with open(os.path.join(RUNTIME_DIR, project + ".log"), "a") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read_string(DEFAULT_CONFIG)
+    cp.read(CONFIG_FILE)
+    return cp
+
+
+def parse_keys(spec):
+    """Turn '^S' or '<C-\\><C-N>:w<CR>' into the characters a terminal sends."""
+    names = {"cr": "\r", "enter": "\r", "esc": "\x1b", "tab": "\t", "space": " ", "lt": "<"}
+    out, i = [], 0
+    while i < len(spec):
+        ch = spec[i]
+        if ch == "^" and i + 1 < len(spec):
+            # Ctrl+letter = the letter's code with bit 0x40 flipped (S=0x53 -> 0x13)
+            out.append(chr(ord(spec[i + 1].upper()) ^ 0x40))
+            i += 2
+            continue
+        if ch == "<":
+            end = spec.find(">", i + 1)
+            token = spec[i + 1:end].lower() if end != -1 else ""
+            if token in names:
+                out.append(names[token])
+                i = end + 1
+                continue
+            if len(token) == 3 and token.startswith("c-"):
+                out.append(chr(ord(token[2].upper()) ^ 0x40))
+                i = end + 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+class EditorProfile:
+    def __init__(self, cp):
+        self.name = cp.get("work", "editor", fallback="nano")
+        section = "editor." + self.name
+        if not cp.has_section(section):
+            die(f"no [{section}] section in {CONFIG_FILE}")
+        s = cp[section]
+        self.command = shlex.split(s.get("command", self.name + " {file}"))
+        self.save = parse_keys(s.get("save", ""))
+        self.quit = parse_keys(s.get("quit", ""))
+        self.discard = parse_keys(s.get("discard", ""))
+        self.dirty = s.get("dirty", "none")
+        self.lockfile = s.get("lockfile", "{dir}/.{name}.swp")
+
+    def argv(self, path):
+        if not any("{file}" in arg for arg in self.command):
+            return self.command + [path]
+        return [arg.replace("{file}", path) for arg in self.command]
+
+    def lockfile_for(self, path):
+        folder, name = os.path.split(path)
+        result = self.lockfile
+        for key, value in (("{dir}", folder), ("{name}", name),
+                           ("{path%}", path.replace("/", "%")), ("{path}", path)):
+            result = result.replace(key, value)
+        return os.path.expanduser(result)
+
+    def is_dirty(self, path):
+        """vim swap files (and nano's --locking files, which copy their format)
+        keep a 'modified' byte at offset 1007. nano sets it but never clears it
+        after saving, so we also require the lock file to be newer than the file:
+        nano rewrites the lock file on the first change after every save."""
+        if self.dirty != "lockfile":
+            return False
+        try:
+            with open(self.lockfile_for(path), "rb") as f:
+                f.seek(1007)
+                flag = f.read(1)
+                lock_mtime = os.fstat(f.fileno()).st_mtime_ns
+        except OSError:
+            return False
+        try:
+            file_mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            file_mtime = 0
+        return flag == b"U" and lock_mtime > file_mtime
+
+
+# --------------------------------------------------------------- sway IPC
+
+class Sway:
+    """Minimal client for sway's IPC socket (the protocol swaymsg speaks):
+    every message is 'i3-ipc' + payload length + message type + JSON payload."""
+    RUN_COMMAND, GET_WORKSPACES, SUBSCRIBE, GET_TREE = 0, 1, 2, 4
+
+    def __init__(self):
+        path = os.environ.get("SWAYSOCK")
+        if not path:
+            die("SWAYSOCK is not set. Is sway running?")
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+
+    def _read(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("sway closed the IPC socket")
+            buf += chunk
+        return buf
+
+    def receive(self):
+        length, kind = struct.unpack("=II", self._read(14)[6:])
+        return kind, json.loads(self._read(length))
+
+    def request(self, kind, payload=""):
+        data = payload.encode()
+        self.sock.sendall(b"i3-ipc" + struct.pack("=II", len(data), kind) + data)
+        return self.receive()[1]
+
+    def command(self, cmd):
+        return self.request(self.RUN_COMMAND, cmd)
+
+    def tree(self):
+        return self.request(self.GET_TREE)
+
+    def workspaces(self):
+        return self.request(self.GET_WORKSPACES)
+
+    def subscribe(self, events):
+        return self.request(self.SUBSCRIBE, json.dumps(events))
+
+
+def walk(node, parent=None, workspace=None):
+    """Yield (node, parent, workspace) for every container in a sway tree."""
+    if node.get("type") == "workspace":
+        workspace = node
+    yield node, parent, workspace
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        yield from walk(child, node, workspace)
+
+
+def quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# ---------------------------------------------- sessions, sockets, spawning
+
+def project_id(root):
+    return hashlib.sha1(root.encode()).hexdigest()[:10]
+
+
+def socket_path(project):
+    return os.path.join(RUNTIME_DIR, project + ".sock")
+
+
+def coordinator_app_id(project):
+    return "work-" + project
+
+
+def editor_app_id(project):
+    return f"work-{project}-{secrets.token_hex(3)}"
+
+
+def send_line(sock, msg):
+    sock.sendall((json.dumps(msg) + "\n").encode())
+
+
+def request(path, msg, timeout=2.0):
+    """Send one message to a coordinator and return its reply (None if nobody answers)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(path)
+            send_line(s, msg)
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            return json.loads(data) if data else None
+    except (OSError, ValueError):
+        return None
+
+
+def spawn(argv, cwd):
+    """Start a program detached from us (own session, no shared terminal)."""
+    env = dict(os.environ)
+    # these tell sway which workspace a new window belongs to; don't pass ours on
+    env.pop("XDG_ACTIVATION_TOKEN", None)
+    env.pop("DESKTOP_STARTUP_ID", None)
+    return subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- launcher
+
+def launch(target):
+    path = os.path.realpath(target)
+    if os.path.isfile(path):
+        # is there a session for this file's folder or one of its parents?
+        folder = os.path.dirname(path)
+        while True:
+            reply = request(socket_path(project_id(folder)), {"cmd": "open", "path": path})
+            if reply and reply.get("ok"):
+                return
+            if os.path.dirname(folder) == folder:
+                break
+            folder = os.path.dirname(folder)
+        start(os.path.dirname(path), path)
+    elif os.path.isdir(path):
+        start(path)
+    else:
+        die(f"{target}: no such file or folder")
+
+
+def start(root, open_file=None):
+    project = project_id(root)
+    app_id = coordinator_app_id(project)
+    sway = Sway()
+    if request(socket_path(project), {"cmd": "ping"}):
+        # already open: just jump there
+        sway.command(f'[app_id="^{app_id}$"] focus')
+        return
+
+    used = {ws["num"] for ws in sway.workspaces()}
+    number = next(n for n in range(1, 1000) if n not in used)
+    label = re.sub(r"[^\w.-]+", "_", os.path.basename(root)) or "root"
+    workspace = f"{number}:{label}"
+    sway.command(f"workspace {quote(workspace)}")
+
+    argv = ["foot", "--app-id", app_id, "--title", f"work: {label}",
+            sys.executable, SELF, "--coordinator", root]
+    if open_file:
+        argv += ["--open", open_file]
+    try:
+        spawn(argv, root)
+    except FileNotFoundError:
+        die("foot is not installed")
+
+    # make sure the window lands on the new workspace, even if focus moved meanwhile
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        for node, _, ws in walk(sway.tree()):
+            if node.get("app_id") == app_id:
+                if ws and ws["name"] != workspace:
+                    sway.command(f"[con_id={node['id']}] move container to workspace {quote(workspace)}; "
+                                 f"workspace {quote(workspace)}")
+                return
+        time.sleep(0.1)
+
+
+# ------------------------------------------------------------ editor proxy
+#
+# Every editor runs as:  foot -> work --edit (this proxy) -> nano
+# The proxy owns a pseudo-terminal (pty) for the editor and copies bytes both
+# ways, so to you it feels like plain nano. It also stays connected to the
+# coordinator, which can "type" into the editor (^S to save, ^X to quit) and
+# set the window title shown on the tab.
+
+def write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def edit_main(sock_path, app_id, path, argv):
+    try:
+        size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+    except OSError:
+        size = None
+
+    pid, master = pty.fork()
+    if pid == 0:  # child: becomes the editor
+        if size:
+            fcntl.ioctl(0, termios.TIOCSWINSZ, size)
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as e:
+            print(f"work: cannot run {argv[0]}: {e.strerror}")
+            os._exit(127)
+
+    def on_resize(*_):
+        try:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+        except OSError:
+            pass
+    signal.signal(signal.SIGWINCH, on_resize)
+
+    saved_tty = termios.tcgetattr(0)
+    tty.setraw(0)  # pass every key (Ctrl+C, Ctrl+S...) straight through
+    try:
+        proxy_loop(sock_path, app_id, path, master)
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, saved_tty)
+
+    os.close(master)
+    code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+    if code != 0:
+        try:
+            input(f"\nwork: the editor exited with status {code}. Press Enter to close.")
+        except (EOFError, OSError):
+            pass
+    sys.exit(max(code, 0))
+
+
+def proxy_loop(sock_path, app_id, path, master):
+    conn, inbox, next_try, title = None, b"", 0.0, None
+    while True:
+        # (re)connect to the coordinator; if it restarts, editors re-register
+        if conn is None and time.monotonic() >= next_try:
+            next_try = time.monotonic() + 2
+            try:
+                conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                conn.connect(sock_path)
+                send_line(conn, {"cmd": "hello", "app_id": app_id, "path": path, "pid": os.getpid()})
+            except OSError:
+                conn.close()
+                conn = None
+
+        watch = [0, master] + ([conn] if conn else [])
+        ready, _, _ = select.select(watch, [], [], 0.05 if title else 1.0)
+
+        if master in ready:  # editor -> screen
+            try:
+                data = os.read(master, 65536)
+            except OSError:  # EIO: the editor exited
+                data = b""
+            if not data:
+                return
+            write_all(1, data)
+
+        if 0 in ready:  # keyboard -> editor
+            data = os.read(0, 65536)
+            if not data:
+                return
+            try:
+                write_all(master, data)
+            except OSError:
+                return
+
+        if conn is not None and conn in ready:  # coordinator -> us
+            try:
+                chunk = conn.recv(65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                conn.close()
+                conn, inbox = None, b""
+            inbox += chunk
+            while b"\n" in inbox:
+                line, inbox = inbox.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("cmd") == "keys":
+                    try:
+                        write_all(master, msg["keys"].encode())
+                    except OSError:
+                        pass
+                elif msg.get("cmd") == "title":
+                    title = "".join(c for c in msg["title"] if c.isprintable())
+
+        # set the window title (OSC 2) only while the editor is quiet, so we
+        # never land in the middle of one of its own escape sequences
+        if title is not None and master not in ready:
+            write_all(1, f"\x1b]2;{title}\x1b\\".encode())
+            title = None
+
+
+# ------------------------------------------------------------- coordinator
+
+class Row:
+    __slots__ = ("path", "name", "depth", "is_dir")
+
+    def __init__(self, path, name, depth, is_dir):
+        self.path, self.name, self.depth, self.is_dir = path, name, depth, is_dir
+
+
+class Tab:
+    """One open editor window."""
+
+    def __init__(self, app_id, path):
+        self.app_id = app_id
+        self.path = path
+        self.proc = None        # the foot process, if we started it
+        self.conn = None        # socket to its proxy, once it has said hello
+        self.con_id = None      # sway container id, once its window appeared
+        self.placed = False
+        self.dirty = False
+        self.title_sent = None
+
+    def send(self, msg):
+        if self.conn is None:
+            return False
+        try:
+            send_line(self.conn, msg)
+            return True
+        except OSError:
+            return False
+
+    def keys(self, keys):
+        return self.send({"cmd": "keys", "keys": keys})
+
+
+class Client:
+    def __init__(self):
+        self.buf = b""
+        self.tab = None
+
+
+class Quit(Exception):
+    pass
+
+
+HELP = """\
+ ↑ ↓  j k     move
+ → l          open folder / file
+ ← h          close folder, go up
+ Enter Space  open file, fold folder
+ click        same as Enter
+ Tab          jump to the editors
+ n            new file (end with /
+              for a folder)
+ s  ^S        save all
+ x            close all editors
+ q            quit (asks first)
+ .            show / hide dotfiles
+ r            reload the tree
+
+ italic + *   unsaved changes
+ •            file is open"""
+
+
+class Coordinator:
+    def __init__(self, scr, root, open_file):
+        self.scr = scr
+        self.root = root
+        self.project = project_id(root)
+        self.app_id = coordinator_app_id(self.project)
+        cp = load_config()
+        self.profile = EditorProfile(cp)
+        self.tree_width = cp.getint("work", "tree_width", fallback=22)
+        self.show_hidden = cp.getboolean("work", "show_hidden", fallback=False)
+
+        self.expanded = set()
+        self.listings = {}      # folder -> (mtime, [(name, is_dir)])
+        self.rows = []
+        self.cursor = 0
+        self.top = 0
+        self.tabs = {}          # app_id -> Tab
+        self.clients = {}       # socket -> Client
+        self.procs = []         # foot processes we started
+        self.message = ""
+        self.prompt = None      # (question, answer line) while asking something
+        self.quitting = None    # deadline while waiting for editors to close
+        self.open_file = open_file
+
+        self.sway = Sway()
+        self.events = Sway()
+        self.events.subscribe(["window"])
+        self.server = self.listen()
+
+    # -------------------------------------------------- setup and main loop
+
+    def listen(self):
+        path = socket_path(self.project)
+        os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+        if request(path, {"cmd": "ping"}):
+            die("already running for this folder")
+        try:
+            os.unlink(path)  # left over from a crash
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(16)
+        server.setblocking(False)
+        return server
+
+    def run(self):
+        curses.raw()
+        curses.set_escdelay(25)
+        curses.curs_set(0)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_BLUE, -1)    # folders
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)  # unsaved files
+        self.scr.nodelay(True)
+        self.scr.keypad(True)
+
+        self.rebuild()
+        if self.open_file:
+            self.reveal(self.open_file)
+            self.open(self.open_file)
+
+        last_poll = 0.0
+        try:
+            while True:
+                self.draw()
+                watch = [0, self.server] + list(self.clients)
+                if self.events:
+                    watch.append(self.events.sock)
+                ready, _, _ = select.select(watch, [], [], 0.5)
+
+                if self.server in ready:
+                    self.accept()
+                if self.events and self.events.sock in ready:
+                    self.on_sway_event()
+                for sock in ready:
+                    if sock in self.clients:
+                        self.on_client(sock)
+                while (key := self.scr.getch()) != -1:
+                    self.on_key(key)
+
+                if time.monotonic() - last_poll >= 0.5:
+                    last_poll = time.monotonic()
+                    self.poll()
+                if self.quitting is not None:
+                    if not self.tabs:
+                        return
+                    if time.monotonic() > self.quitting:
+                        self.quitting = None
+                        self.message = f"{len(self.tabs)} editor(s) didn't close"
+        except Quit:
+            return
+        finally:
+            self.server.close()
+            try:
+                os.unlink(socket_path(self.project))
+            except OSError:
+                pass
+
+    def poll(self):
+        """Twice a second: reap finished processes, check for unsaved changes,
+        notice new/removed files, finish window placement."""
+        for proc in self.procs[:]:
+            if proc.poll() is not None:
+                self.procs.remove(proc)
+        for tab in list(self.tabs.values()):
+            if tab.proc and tab.proc.returncode is not None and tab.conn is None:
+                del self.tabs[tab.app_id]  # editor window died before it said hello
+                self.message = f"couldn't open {self.rel(tab.path)}"
+                continue
+            tab.dirty = self.profile.is_dirty(tab.path)
+            title = self.tab_title(tab)
+            if tab.title_sent != title and tab.send({"cmd": "title", "title": title}):
+                tab.title_sent = title
+            if tab.con_id is not None and not tab.placed:
+                self.place(tab)
+        self.rebuild()
+
+    # -------------------------------------------------------- file tree
+
+    def rel(self, path):
+        return os.path.relpath(path, self.root)
+
+    def listdir(self, folder):
+        try:
+            mtime = os.stat(folder).st_mtime_ns
+        except OSError:
+            return []
+        cached = self.listings.get(folder)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        entries = []
+        try:
+            with os.scandir(folder) as it:
+                all_entries = list(it)
+        except OSError:
+            all_entries = []
+        names = {e.name for e in all_entries}
+        for e in all_entries:
+            if e.name.startswith(".") and not self.show_hidden:
+                continue
+            # hide editor lock files (.NAME.swp next to NAME)
+            if e.name.startswith(".") and e.name.endswith(".swp") and e.name[1:-4] in names:
+                continue
+            try:
+                is_dir = e.is_dir()
+            except OSError:
+                is_dir = False
+            entries.append((e.name, is_dir))
+        entries.sort(key=lambda entry: (not entry[1], entry[0].lower()))
+        self.listings[folder] = (mtime, entries)
+        return entries
+
+    def rebuild(self):
+        selected = self.rows[self.cursor].path if self.rows else None
+        rows = []
+
+        def add(folder, depth):
+            for name, is_dir in self.listdir(folder):
+                path = os.path.join(folder, name)
+                rows.append(Row(path, name, depth, is_dir))
+                if is_dir and path in self.expanded:
+                    add(path, depth + 1)
+
+        add(self.root, 0)
+        self.rows = rows
+        self.select(selected)
+
+    def select(self, path):
+        for i, row in enumerate(self.rows):
+            if row.path == path:
+                self.cursor = i
+                return True
+        self.cursor = max(0, min(self.cursor, len(self.rows) - 1))
+        return False
+
+    def reveal(self, path):
+        """Unfold every folder above path and put the cursor on it."""
+        folder = os.path.dirname(path)
+        while folder.startswith(self.root + os.sep):
+            self.expanded.add(folder)
+            folder = os.path.dirname(folder)
+        self.rebuild()
+        self.select(path)
+
+    def current(self):
+        return self.rows[self.cursor] if self.rows else None
+
+    def toggle(self, row):
+        if row.path in self.expanded:
+            self.expanded.discard(row.path)
+        else:
+            self.expanded.add(row.path)
+        self.rebuild()
+
+    # ---------------------------------------------------------- drawing
+
+    def put(self, y, x, text, attr=0):
+        width = self.scr.getmaxyx()[1] - x
+        if width <= 0:
+            return
+        if len(text) > width:
+            text = text[:width - 1] + "…"
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass  # writing the very last cell of the screen "fails" but works
+
+    def render_row(self, row, open_tabs, dirty_paths):
+        indent = "  " * row.depth
+        if row.is_dir:
+            expanded = row.path in self.expanded
+            text = f"{indent}{'▾' if expanded else '▸'} {row.name}/"
+            attr = curses.color_pair(1) | curses.A_BOLD
+            if not expanded and any(p.startswith(row.path + os.sep) for p in dirty_paths):
+                text += " *"
+                attr |= curses.A_ITALIC
+            return text, attr
+        tab = open_tabs.get(row.path)
+        if tab is None:
+            return f"{indent}  {row.name}", curses.A_NORMAL
+        if tab.dirty:
+            return f"{indent}• {row.name} *", curses.A_BOLD | curses.A_ITALIC | curses.color_pair(2)
+        return f"{indent}• {row.name}", curses.A_BOLD
+
+    def draw(self):
+        scr = self.scr
+        height, width = scr.getmaxyx()
+        scr.erase()
+        if height < 4 or width < 10:
+            scr.refresh()
+            return
+        footer = 2 if self.prompt else 1
+        body = height - 1 - footer
+
+        name = os.path.basename(self.root) or "/"
+        dirty = sum(t.dirty for t in self.tabs.values())
+        info = f"{len(self.tabs)} open" + (f" · {dirty} unsaved" if dirty else "")
+        self.put(0, 0, " " + name, curses.A_BOLD)
+        if len(name) + len(info) + 3 <= width:
+            self.put(0, width - len(info) - 1, info, curses.A_DIM)
+
+        if self.cursor < self.top:
+            self.top = self.cursor
+        if self.cursor >= self.top + body:
+            self.top = self.cursor - body + 1
+        self.top = max(0, min(self.top, len(self.rows) - body))
+
+        open_tabs = {t.path: t for t in self.tabs.values()}
+        dirty_paths = [t.path for t in self.tabs.values() if t.dirty]
+        for y in range(body):
+            i = self.top + y
+            if i >= len(self.rows):
+                break
+            text, attr = self.render_row(self.rows[i], open_tabs, dirty_paths)
+            if i == self.cursor:
+                text, attr = text.ljust(width), attr | curses.A_REVERSE
+            self.put(1 + y, 0, text, attr)
+        if not self.rows:
+            self.put(1, 2, "(empty folder)", curses.A_DIM)
+
+        if self.prompt:
+            question, answer = self.prompt
+            self.put(height - 2, 0, " " + question, curses.A_BOLD)
+            self.put(height - 1, 0, " " + answer)
+        else:
+            self.put(height - 1, 0, " " + (self.message or "? help"), curses.A_DIM)
+        scr.noutrefresh()
+        curses.doupdate()
+
+    def show_help(self):
+        self.scr.erase()
+        for y, line in enumerate(HELP.splitlines()):
+            self.put(y, 0, line)
+        self.put(self.scr.getmaxyx()[0] - 1, 0, " any key: back", curses.A_DIM)
+        self.scr.nodelay(False)
+        while self.scr.getch() == curses.KEY_RESIZE:
+            pass
+        self.scr.nodelay(True)
+
+    def ask(self, question, answer, valid):
+        """Ask in the footer; returns one of the characters in valid, or None."""
+        self.scr.nodelay(False)
+        try:
+            self.prompt = (question, answer)
+            while True:
+                self.draw()
+                key = self.scr.getch()
+                if key in (27, 3):  # Esc, Ctrl+C
+                    return None
+                if 0 < key < 256 and chr(key).lower() in valid:
+                    return chr(key).lower()
+        finally:
+            self.prompt = None
+            self.scr.nodelay(True)
+
+    def read_line(self, question):
+        """Let the user type a line in the footer; None if cancelled with Esc."""
+        text = ""
+        self.scr.nodelay(False)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                self.prompt = (question, text)
+                self.draw()
+                height, width = self.scr.getmaxyx()
+                self.scr.move(height - 1, min(1 + len(text), width - 1))
+                ch = self.scr.get_wch()
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    return text
+                if ch in ("\x1b", "\x03"):
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    text = text[:-1]
+                elif isinstance(ch, str) and ch.isprintable():
+                    text += ch
+        finally:
+            self.prompt = None
+            self.scr.nodelay(True)
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    # ------------------------------------------------------------- keys
+
+    def on_key(self, key):
+        if key == curses.KEY_RESIZE:
+            return
+        self.message = ""
+        row = self.current()
+        height = self.scr.getmaxyx()[0]
+        if key in (curses.KEY_UP, ord("k")):
+            self.cursor = max(0, self.cursor - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.cursor = min(len(self.rows) - 1, self.cursor + 1)
+        elif key == curses.KEY_PPAGE:
+            self.cursor = max(0, self.cursor - (height - 3))
+        elif key == curses.KEY_NPAGE:
+            self.cursor = min(len(self.rows) - 1, self.cursor + (height - 3))
+        elif key in (curses.KEY_HOME, ord("g")):
+            self.cursor = 0
+        elif key in (curses.KEY_END, ord("G")):
+            self.cursor = max(0, len(self.rows) - 1)
+        elif key in (curses.KEY_RIGHT, ord("l")) and row:
+            if not row.is_dir:
+                self.open(row.path)
+            elif row.path not in self.expanded:
+                self.toggle(row)
+            else:
+                self.cursor = min(len(self.rows) - 1, self.cursor + 1)
+        elif key in (curses.KEY_LEFT, ord("h")) and row:
+            if row.is_dir and row.path in self.expanded:
+                self.toggle(row)
+            else:
+                self.select(os.path.dirname(row.path))
+        elif key in (10, 13, curses.KEY_ENTER, ord(" ")) and row:
+            self.activate(row)
+        elif key == curses.KEY_MOUSE:
+            self.on_mouse()
+        elif key in (ord("s"), 19):  # s, Ctrl+S
+            self.save_all()
+        elif key == ord("x"):
+            self.close_all()
+        elif key in (ord("q"), 3, 17):  # q, Ctrl+C, Ctrl+Q
+            self.close_all(then_quit=True)
+        elif key == ord("."):
+            self.show_hidden = not self.show_hidden
+            self.listings.clear()
+            self.rebuild()
+            self.message = "showing dotfiles" if self.show_hidden else "hiding dotfiles"
+        elif key == ord("r"):
+            self.listings.clear()
+            self.rebuild()
+        elif key == ord("n"):
+            self.new_file()
+        elif key == 9:  # Tab
+            self.sway.command("focus right")
+        elif key == ord("?"):
+            self.show_help()
+
+    def on_mouse(self):
+        try:
+            _, _, y, _, state = curses.getmouse()
+        except curses.error:
+            return
+        wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
+        wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
+        if state & wheel_up:
+            self.cursor = max(0, self.cursor - 3)
+        elif state & wheel_down:
+            self.cursor = min(len(self.rows) - 1, self.cursor + 3)
+        elif state & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+            i = self.top + y - 1
+            if y >= 1 and 0 <= i < len(self.rows):
+                self.cursor = i
+                self.activate(self.rows[i])
+
+    def activate(self, row):
+        if row.is_dir:
+            self.toggle(row)
+        else:
+            self.open(row.path)
+
+    def new_file(self):
+        row = self.current()
+        if row is None:
+            base = self.root
+        else:
+            base = row.path if row.is_dir else os.path.dirname(row.path)
+        shown = self.rel(base)
+        name = self.read_line(f"new in {'' if shown == '.' else shown + '/'}")
+        if not name:
+            return
+        target = os.path.normpath(os.path.join(base, name))
+        if not target.startswith(self.root + os.sep):
+            self.message = "that's outside the project"
+            return
+        if os.path.exists(target):
+            self.message = f"{self.rel(target)} already exists"
+            return
+        try:
+            if name.endswith("/"):
+                os.makedirs(target)
+            else:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                open(target, "x").close()
+        except OSError as e:
+            self.message = e.strerror
+            return
+        self.reveal(target)
+        if os.path.isfile(target):
+            self.open(target)
+
+    # ---------------------------------------------------------- editors
+
+    def tab_for(self, path):
+        return next((t for t in self.tabs.values() if t.path == path), None)
+
+    def tab_title(self, tab):
+        return ("* " if tab.dirty else "") + self.rel(tab.path)
+
+    def focus(self, tab):
+        if tab.con_id is not None:
+            self.sway.command(f"[con_id={tab.con_id}] focus")
+        else:
+            self.sway.command(f'[app_id="^{tab.app_id}$"] focus')
+
+    def open(self, path):
+        tab = self.tab_for(path)
+        if tab:
+            self.focus(tab)
+            return
+        tab = Tab(editor_app_id(self.project), path)
+        argv = ["foot", "--app-id", tab.app_id, "--title", self.rel(path),
+                sys.executable, SELF, "--edit", socket_path(self.project), tab.app_id, path,
+                "--"] + self.profile.argv(path)
+        # focus an existing editor first, so sway opens the new window right
+        # inside the tabbed pane instead of next to the tree
+        placed = [t for t in self.tabs.values() if t.con_id is not None]
+        if placed:
+            self.sway.command(f"[con_id={placed[-1].con_id}] focus")
+        try:
+            tab.proc = spawn(argv, os.path.dirname(path))
+        except OSError as e:
+            self.message = f"can't start foot: {e.strerror}"
+            return
+        self.procs.append(tab.proc)
+        self.tabs[tab.app_id] = tab
+        self.message = f"opening {os.path.basename(path)}"
+
+    def on_sway_event(self):
+        try:
+            _, event = self.events.receive()
+        except (ConnectionError, OSError, ValueError):
+            self.events = None
+            return
+        container = event.get("container") or {}
+        if event.get("change") == "new" and container.get("app_id") in self.tabs:
+            tab = self.tabs[container["app_id"]]
+            tab.con_id = container["id"]
+            self.place(tab)
+
+    def place(self, tab):
+        """Put a new editor window into the tabbed pane right of the tree."""
+        nodes = list(walk(self.sway.tree()))
+        me = f"[con_id={tab.con_id}]"
+        mine = next(((n, ws) for n, _, ws in nodes if n["id"] == tab.con_id), None)
+        coordinator = next(((n, ws) for n, _, ws in nodes if n.get("app_id") == self.app_id), None)
+        if mine is None:
+            return
+        if coordinator is None:
+            return  # the tree's window isn't there yet; poll() tries again
+        prefix = f"work-{self.project}-"
+        others = [n for n, _, _ in nodes
+                  if (n.get("app_id") or "").startswith(prefix) and n["id"] != tab.con_id]
+        coordinator_node, coordinator_ws = coordinator
+
+        if others:
+            # join the existing tabs: mark the last editor, move behind it
+            mark = f"_work_{self.project}"
+            commands = [f"[con_id={others[-1]['id']}] mark --add {mark}",
+                        f"{me} move container to mark {mark}"]
+        else:
+            # first editor: split it off next to the tree and make that pane tabbed
+            commands = []
+            if mine[1] and coordinator_ws and mine[1]["id"] != coordinator_ws["id"]:
+                commands.append(f"{me} move container to workspace {quote(coordinator_ws['name'])}")
+            commands += [f"[con_id={coordinator_node['id']}] layout splith",
+                         f"{me} split vertical",
+                         f"{me} layout tabbed"]
+        commands += [f"[con_id={coordinator_node['id']}] resize set width {self.tree_width} ppt",
+                     f"{me} focus"]
+        for command in commands:
+            for result in self.sway.command(command):
+                if not result.get("success"):
+                    log(self.project, f"sway: {command!r}: {result.get('error')}")
+        tab.placed = True
+
+    def save_all(self):
+        dirty = [t for t in self.tabs.values() if self.profile.is_dirty(t.path)]
+        if not dirty:
+            self.message = "nothing to save"
+            return
+        sent = sum(t.keys(self.profile.save) for t in dirty)
+        self.message = f"saved {sent} file(s)"
+
+    def close_all(self, then_quit=False):
+        plan = []
+        for tab in sorted(self.tabs.values(), key=lambda t: t.path):
+            tab.dirty = self.profile.is_dirty(tab.path)
+            if not tab.dirty:
+                plan.append((tab, self.profile.quit))
+                continue
+            self.reveal(tab.path)
+            answer = self.ask(f"{self.rel(tab.path)} has unsaved changes",
+                              "[s]ave  [d]iscard  [c]ancel", "sdc")
+            if answer not in ("s", "d"):
+                self.message = "cancelled"
+                return
+            keys = self.profile.save + self.profile.quit if answer == "s" else self.profile.discard
+            plan.append((tab, keys))
+
+        lost = [tab for tab, keys in plan if not tab.keys(keys)]
+        if lost:
+            self.message = f"can't reach {len(lost)} editor(s), close them by hand"
+            return
+        if then_quit:
+            if not self.tabs:
+                raise Quit
+            self.quitting = time.monotonic() + 5
+            self.message = "closing editors…"
+        else:
+            self.message = f"closing {len(plan)} editor(s)" if plan else "no editors open"
+
+    # ---------------------------------------------------- socket clients
+
+    def accept(self):
+        try:
+            sock, _ = self.server.accept()
+        except OSError:
+            return
+        sock.setblocking(False)
+        self.clients[sock] = Client()
+
+    def drop(self, sock):
+        client = self.clients.pop(sock)
+        sock.close()
+        if client.tab:
+            self.tabs.pop(client.tab.app_id, None)
+
+    def on_client(self, sock):
+        client = self.clients[sock]
+        try:
+            data = sock.recv(65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if not data:
+            self.drop(sock)
+            return
+        client.buf += data
+        while b"\n" in client.buf:
+            line, client.buf = client.buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            reply = self.on_message(client, sock, msg)
+            if reply is not None:
+                try:
+                    send_line(sock, reply)
+                except OSError:
+                    pass
+
+    def on_message(self, client, sock, msg):
+        cmd = msg.get("cmd")
+        if cmd == "hello":  # an editor proxy (maybe from before a restart)
+            tab = self.tabs.get(msg["app_id"]) or Tab(msg["app_id"], msg["path"])
+            tab.conn, tab.title_sent = sock, None
+            self.tabs[tab.app_id] = tab
+            client.tab = tab
+            return None
+        if cmd == "ping":
+            return {"ok": True}
+        if cmd == "open":
+            path = os.path.realpath(msg.get("path", ""))
+            if not path.startswith(self.root + os.sep) or not os.path.isfile(path):
+                return {"ok": False}
+            self.reveal(path)
+            self.open(path)
+            return {"ok": True}
+        if cmd == "status":
+            return {"ok": True, "root": self.root,
+                    "tabs": [{"path": t.path, "dirty": t.dirty, "app_id": t.app_id,
+                              "con_id": t.con_id} for t in self.tabs.values()]}
+        return {"ok": False, "error": "unknown command"}
+
+
+def coordinator_main(root, open_file):
+    def stop(*_):
+        raise SystemExit
+    signal.signal(signal.SIGHUP, stop)   # our window was closed
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        curses.wrapper(lambda scr: Coordinator(scr, root, open_file).run())
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        log(project_id(root), traceback.format_exc())
+        try:
+            input("\nwork crashed (see above). Press Enter to close.")
+        except (EOFError, OSError):
+            pass
+
+
+# -------------------------------------------------------------------- main
+
+def main(args):
+    if args[:1] == ["--coordinator"] and len(args) >= 2:
+        open_file = args[3] if args[2:3] == ["--open"] and len(args) >= 4 else None
+        coordinator_main(args[1], open_file)
+    elif args[:1] == ["--edit"] and len(args) >= 6 and args[4] == "--":
+        edit_main(args[1], args[2], args[3], args[5:])
+    elif args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+    elif args[:1] == ["--default-config"]:
+        print(DEFAULT_CONFIG.strip())
+    elif len(args) > 1 or (args and args[0].startswith("-")):
+        die("usage: work [DIR | FILE]   (work --help for more)")
+    else:
+        launch(args[0] if args else ".")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
